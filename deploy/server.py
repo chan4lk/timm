@@ -82,7 +82,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
 
         messages = body.get("messages", [])
-        temperature = body.get("temperature", 0.1)
+        temperature = body.get("temperature", 0.0)
         max_tokens = body.get("max_tokens", 256)
         stream = body.get("stream", False)
 
@@ -197,7 +197,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
 
         prompt = body.get("prompt", "")
-        temperature = body.get("temperature", 0.1)
+        temperature = body.get("temperature", 0.0)
         max_tokens = body.get("max_tokens", 256)
 
         result = ENGINE.predict(
