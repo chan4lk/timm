@@ -153,7 +153,7 @@ async function loadModels() {
       modelSelect.appendChild(opt);
       if (m.meta) {
         const params = m.meta.params ? (m.meta.params / 1e6).toFixed(1) + 'M' : '?';
-        const q = m.meta.quantized ? 'INT4' : 'FP16';
+        const q = m.meta.quantized === true ? 'INT4' : 'FP16';
         modelInfo.textContent = `${params} params | ${q} | MLX`;
       }
     }
@@ -291,7 +291,7 @@ async function sendMessage() {
           {role: 'system', content: JSON.stringify(ctx)},
           {role: 'user', content: query},
         ],
-        temperature: 0.1,
+        temperature: 0.0,
         asms_live: liveToggle.checked,
       }),
     });
