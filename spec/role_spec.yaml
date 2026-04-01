@@ -1,0 +1,248 @@
+agent_name: okr_assistant
+version: "1.0"
+description: >
+  OKR management agent following John Doerr's "Measure What Matters" methodology.
+  Translates business goals into structured OKRs, manages progress check-ins,
+  generates reports, and enforces methodology best practices via Keyflow MCP.
+
+tools:
+  - name: cycle
+    description: Manage OKR cycles (quarters, sprints, custom periods)
+    operations:
+      - action: create
+        params:
+          name: { type: string, required: true, description: "Cycle name e.g. 'Q2 2026'" }
+          startDate: { type: date, required: true, format: "YYYY-MM-DD" }
+          endDate: { type: date, required: true, format: "YYYY-MM-DD" }
+      - action: get
+        params:
+          cycleId: { type: string, required: true }
+      - action: list
+        params:
+          status: { type: enum, values: [active, upcoming, completed], default: active }
+      - action: update
+        params:
+          cycleId: { type: string, required: true }
+          name: { type: string }
+          startDate: { type: date }
+          endDate: { type: date }
+
+  - name: objective
+    description: Manage objectives within a cycle
+    operations:
+      - action: create
+        params:
+          title: { type: string, required: true, description: "Qualitative, aspirational statement" }
+          description: { type: string, description: "Context and motivation" }
+          cycleId: { type: string, required: true }
+          ownerId: { type: string, required: true }
+          type: { type: enum, values: [committed, aspirational], default: aspirational }
+          level: { type: enum, values: [company, department, team, individual], default: individual }
+          parentObjectiveId: { type: string, description: "For alignment/cascading" }
+      - action: get
+        params:
+          objectiveId: { type: string, required: true }
+      - action: list
+        params:
+          cycleId: { type: string, required: true }
+          ownerId: { type: string }
+          level: { type: enum, values: [company, department, team, individual] }
+      - action: update
+        params:
+          objectiveId: { type: string, required: true }
+          title: { type: string }
+          description: { type: string }
+          type: { type: enum, values: [committed, aspirational] }
+      - action: delete
+        params:
+          objectiveId: { type: string, required: true }
+
+  - name: key_result
+    description: Manage key results attached to objectives
+    operations:
+      - action: create
+        params:
+          objectiveId: { type: string, required: true }
+          title: { type: string, required: true, description: "Quantitative, measurable statement" }
+          metricType: { type: enum, required: true, values: [NUMERIC, PERCENTAGE, BOOLEAN, MILESTONE] }
+          startValue: { type: number, default: 0 }
+          targetValue: { type: number, required: true }
+          currentValue: { type: number, default: 0 }
+          unit: { type: string, description: "e.g. users, %, dollars, points" }
+      - action: get
+        params:
+          keyResultId: { type: string, required: true }
+      - action: list
+        params:
+          objectiveId: { type: string, required: true }
+      - action: update
+        params:
+          keyResultId: { type: string, required: true }
+          currentValue: { type: number }
+          score: { type: number, min: 0.0, max: 1.0 }
+          title: { type: string }
+      - action: delete
+        params:
+          keyResultId: { type: string, required: true }
+
+  - name: user
+    description: User management and context
+    operations:
+      - action: get
+        params:
+          userId: { type: string, required: true }
+      - action: list
+        params:
+          team: { type: string }
+      - action: onboard
+        params:
+          name: { type: string, required: true }
+          role: { type: string, required: true }
+          team: { type: string, required: true }
+          managerId: { type: string }
+
+  - name: report
+    description: Generate OKR reports and health checks
+    operations:
+      - action: progress
+        params:
+          cycleId: { type: string, required: true }
+          ownerId: { type: string }
+          format: { type: enum, values: [summary, detailed], default: summary }
+      - action: health
+        params:
+          cycleId: { type: string, required: true }
+          level: { type: enum, values: [company, department, team, individual], default: team }
+      - action: summary
+        params:
+          cycleId: { type: string, required: true }
+
+workflows:
+  - name: goal_to_okr
+    description: Translate a vague business goal into structured OKR(s)
+    trigger_phrases:
+      - "I want to"
+      - "Our goal is"
+      - "We need to improve"
+      - "Help me create OKRs for"
+      - "Set objectives for"
+    tool_sequence: [objective.create, key_result.create]
+    methodology_checks:
+      - objective_is_qualitative
+      - key_results_are_measurable
+      - three_to_five_krs_per_objective
+      - stretch_target_set
+
+  - name: view_okrs
+    description: Display current OKRs with progress
+    trigger_phrases:
+      - "Show me my OKRs"
+      - "What are my objectives"
+      - "Current progress"
+      - "Where do I stand"
+    tool_sequence: [cycle.list, objective.list, key_result.list]
+
+  - name: check_in
+    description: Update progress on key results
+    trigger_phrases:
+      - "Update progress"
+      - "Check in"
+      - "We hit"
+      - "Score is now"
+      - "Completed"
+    tool_sequence: [key_result.update]
+    methodology_checks:
+      - score_in_valid_range
+      - detect_sandbagging
+
+  - name: onboard
+    description: Generate starter OKRs for a new team member
+    trigger_phrases:
+      - "New hire"
+      - "Onboard"
+      - "Starter OKRs for"
+    tool_sequence: [user.onboard, objective.create, key_result.create]
+    methodology_checks:
+      - committed_ratio_60_percent
+      - ramp_appropriate_targets
+
+  - name: reports
+    description: Generate OKR reports and health checks
+    trigger_phrases:
+      - "Report"
+      - "Health check"
+      - "Summary"
+      - "How is the team doing"
+    tool_sequence: [report.progress, report.health, report.summary]
+
+  - name: align
+    description: Connect objectives to parent/team/company objectives
+    trigger_phrases:
+      - "Align"
+      - "Connect to company goals"
+      - "Cascade"
+      - "Roll up"
+    tool_sequence: [objective.list, objective.update]
+
+constraints:
+  methodology:
+    - rule: max_objectives_per_cycle
+      value: 5
+      description: "Focus: 3-5 objectives per cycle maximum"
+    - rule: max_key_results_per_objective
+      value: 5
+      description: "3-5 key results per objective"
+    - rule: stretch_target_score
+      value: 0.7
+      description: "Aspirational OKRs target 0.7 score (Doerr sweet spot)"
+    - rule: committed_score_target
+      value: 1.0
+      description: "Committed OKRs must hit 1.0"
+    - rule: committed_aspirational_ratio
+      value: "60:40"
+      description: "~60% committed, ~40% aspirational"
+    - rule: objective_must_be_qualitative
+      description: "Objectives are inspirational, not numeric"
+    - rule: key_result_must_be_measurable
+      description: "Every KR needs a metric type and target value"
+
+  anti_patterns:
+    - name: sandbagging
+      description: "Scoring 1.0 on aspirational goals suggests targets were too easy"
+      detection: "score == 1.0 AND objective.type == aspirational"
+      action: "Flag and suggest more ambitious targets"
+    - name: too_many_okrs
+      description: "More than 5 objectives dilutes focus"
+      detection: "count(objectives) > 5 for a cycle"
+      action: "Suggest consolidation or prioritization"
+    - name: metrics_as_objectives
+      description: "Objectives should not be numeric targets"
+      detection: "objective.title contains numbers or percentages"
+      action: "Rewrite as qualitative aspiration, move metric to KR"
+    - name: tasks_as_key_results
+      description: "KRs measure outcomes, not activities"
+      detection: "key_result.title starts with verb (launch, build, ship, deploy)"
+      action: "Rewrite to measure the outcome of the activity"
+    - name: set_and_forget
+      description: "No check-ins for >2 weeks"
+      detection: "key_result.lastUpdated > 14 days ago"
+      action: "Prompt for check-in"
+
+input_schema:
+  type: object
+  properties:
+    query: { type: string, description: "Natural language user input" }
+    session_context:
+      type: object
+      properties:
+        userId: { type: string }
+        activeCycleId: { type: string }
+        activeCycleName: { type: string }
+        team: { type: string }
+
+decision_space_analysis:
+  tool_operations: 20
+  workflow_routes: 6
+  methodology_decisions: 8
+  effective_cardinality: 500
+  complexity_class: MEDIUM

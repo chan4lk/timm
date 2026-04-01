@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Model checkpoints (large binary files)
+model/checkpoints/
+model/tokenizer/*.model
+model/tokenizer/*.vocab
+
+# Corpus data (regenerable)
+corpus/data/
+
+# Evaluation reports
+eval/benchmark_report.json
+eval/test_sets/*.jsonl
+
+# Environment
+.env
+.venv/
+*.egg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

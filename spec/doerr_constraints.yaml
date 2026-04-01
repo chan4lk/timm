@@ -1,0 +1,99 @@
+doerr_methodology:
+  source: "Measure What Matters - John Doerr"
+
+  four_superpowers:
+    - name: focus
+      rule: "3-5 objectives per cycle, no more"
+      enforcement: hard_limit
+    - name: align
+      rule: "Individual OKRs connect to team/company objectives"
+      enforcement: suggest
+    - name: track
+      rule: "Regular check-ins, score 0.0-1.0"
+      enforcement: prompt_after_14_days
+    - name: stretch
+      rule: "Target 0.7 on aspirational goals"
+      enforcement: flag_sandbagging
+
+  scoring:
+    scale: [0.0, 1.0]
+    zones:
+      - range: [0.0, 0.3]
+        label: "Failed to make real progress"
+        color: red
+        action: "Discuss blockers, consider dropping or reformulating"
+      - range: [0.4, 0.6]
+        label: "Made progress but fell short"
+        color: yellow
+        action: "Identify what prevented full delivery"
+      - range: [0.7, 1.0]
+        label: "Delivered"
+        color: green
+        action: "Celebrate, check if aspirational target was too easy"
+
+  okr_types:
+    committed:
+      ratio: 0.6
+      expected_score: 1.0
+      description: "Promises — must deliver"
+      failure_action: "Requires post-mortem on why commitment was missed"
+    aspirational:
+      ratio: 0.4
+      expected_score: 0.7
+      description: "Moonshots — 0.7 is success"
+      perfect_score_warning: "1.0 on aspirational = sandbagging"
+
+  levels:
+    - company
+    - department
+    - team
+    - individual
+
+  cfr_framework:
+    conversations: "Regular 1:1s about OKR progress"
+    feedback: "Continuous, constructive peer feedback"
+    recognition: "Celebrate progress, not just completion"
+
+  quality_checks:
+    objective:
+      - check: is_qualitative
+        rule: "Must NOT contain numbers, percentages, or metrics"
+        examples:
+          good: "Delight our enterprise customers"
+          bad: "Increase NPS to 50"
+      - check: is_aspirational
+        rule: "Should inspire action, not describe a task"
+        examples:
+          good: "Build a world-class onboarding experience"
+          bad: "Launch onboarding v2"
+      - check: is_time_bound
+        rule: "Achievable within the cycle period"
+      - check: is_concise
+        rule: "One sentence, ideally under 15 words"
+
+    key_result:
+      - check: is_measurable
+        rule: "Must have a metric type and numeric target"
+      - check: is_outcome_not_task
+        rule: "Measures result, not activity"
+        examples:
+          good: "Reduce customer churn from 5% to 2%"
+          bad: "Send retention emails to all customers"
+      - check: has_baseline
+        rule: "Start value establishes where we are now"
+      - check: is_achievable
+        rule: "Stretch but not impossible"
+
+  metric_types:
+    NUMERIC:
+      description: "Counting things"
+      examples: ["100 new customers", "50 features shipped"]
+    PERCENTAGE:
+      description: "Ratios and rates"
+      examples: ["Reduce churn from 5% to 2%", "95% uptime"]
+    BOOLEAN:
+      description: "Yes/No milestones"
+      examples: ["Launch product v2", "Achieve SOC2 certification"]
+    MILESTONE:
+      description: "Phased completion"
+      examples: ["Complete phases 1-3 of migration", "Hire for all open roles"]
