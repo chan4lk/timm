@@ -10,6 +10,8 @@ Includes:
 
 import json
 import subprocess
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 import yaml
@@ -32,6 +34,27 @@ class KeyflowBridge:
             mcp_config_path = str(Path(__file__).parent.parent / ".mcp.json")
         with open(mcp_config_path) as f:
             self.mcp_config = json.load(f)
+
+        # Extract Keyflow endpoint URL and auth from mcp config
+        keyflow_cfg = self.mcp_config.get("mcpServers", {}).get("keyflow", {})
+        args = keyflow_cfg.get("args", [])
+        self.endpoint_url = None
+        self.auth_header = None
+        for i, arg in enumerate(args):
+            if arg.startswith("https://"):
+                self.endpoint_url = arg
+            if arg == "--header" and i + 1 < len(args):
+                self.auth_header = args[i + 1]
+
+        # MCP subprocess state
+        self._process = None
+        self._connected = False
+        self._msg_id = 0
+
+        if self.endpoint_url:
+            print(f"Keyflow MCP endpoint: {self.endpoint_url}")
+        else:
+            print("Warning: Keyflow MCP endpoint not found in .mcp.json")
 
     def validate_tool_call(self, tool_call: dict) -> tuple[bool, str]:
         """Validate a tool call against the Keyflow schema."""
@@ -108,19 +131,203 @@ class KeyflowBridge:
 
         return results
 
-    def _execute_mcp(self, mcp_call: dict) -> dict:
-        """Execute a single MCP call via the configured transport."""
-        # In production, this would use the MCP client SDK.
-        # For now, format as JSON-RPC for the Keyflow MCP endpoint.
-        keyflow_config = self.mcp_config.get("mcpServers", {}).get("keyflow", {})
-        if not keyflow_config:
-            return {"status": "error", "message": "Keyflow MCP not configured"}
+    def connect(self) -> bool:
+        """Spawn mcp-remote subprocess and initialize MCP session.
 
-        return {
-            "status": "would_execute",
-            "mcp_call": mcp_call,
-            "endpoint": keyflow_config.get("args", [None, ""])[1],
+        The Keyflow MCP server uses OAuth. On first connection, mcp-remote
+        will print an auth URL to stderr. The user must visit that URL in
+        a browser to authorize. After auth, the connection completes.
+        """
+        if self._process and self._process.poll() is None:
+            return True  # already connected
+
+        if not self.endpoint_url:
+            print("No Keyflow MCP endpoint configured")
+            return False
+
+        cmd = ["npx", "mcp-remote", self.endpoint_url]
+        if self.auth_header:
+            cmd += ["--header", self.auth_header]
+
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+
+            # mcp-remote needs time to discover OAuth and start the flow
+            import os
+            import time
+            import webbrowser
+
+            os.set_blocking(self._process.stderr.fileno(), False)
+            os.set_blocking(self._process.stdout.fileno(), False)
+
+            # Wait for mcp-remote to be ready (may need OAuth)
+            auth_url = None
+            start = time.time()
+            while time.time() - start < 15:
+                try:
+                    line = self._process.stderr.readline()
+                    if line:
+                        line = line.strip()
+                        if "authorize" in line.lower() and "http" in line:
+                            # Extract URL from the line
+                            for part in line.split():
+                                if part.startswith("http"):
+                                    auth_url = part
+                                    break
+                            if not auth_url and ":\n" not in line:
+                                # URL might be on next line
+                                next_line = self._process.stderr.readline().strip()
+                                if next_line.startswith("http"):
+                                    auth_url = next_line
+                            if auth_url:
+                                print(f"\n{'='*50}")
+                                print("  Keyflow MCP requires OAuth authorization.")
+                                print(f"  Opening browser to: {auth_url[:80]}...")
+                                print(f"{'='*50}\n")
+                                webbrowser.open(auth_url)
+                        elif "connected" in line.lower() or "ready" in line.lower():
+                            break
+                except (IOError, OSError):
+                    pass
+                time.sleep(0.5)
+
+            # Restore blocking mode for normal operation
+            os.set_blocking(self._process.stdout.fileno(), True)
+
+            # Wait a bit for OAuth callback if auth was needed
+            if auth_url:
+                print("Waiting for OAuth authorization (up to 60s)...")
+                time.sleep(5)  # give user time to authorize
+
+            # Send initialize request
+            init_msg = {
+                "jsonrpc": "2.0",
+                "id": self._next_id(),
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "asms-bridge", "version": "1.0"},
+                },
+            }
+            response = self._send_rpc(init_msg, timeout=30)
+            if response and "result" in response:
+                # Send initialized notification
+                self._write_msg({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                server_info = response["result"].get("serverInfo", {})
+                print(f"MCP session established: {server_info}")
+                self._connected = True
+                return True
+            else:
+                print(f"MCP init failed: {response}")
+                if auth_url:
+                    print("Did you complete the OAuth authorization in the browser?")
+                self.disconnect()
+                return False
+        except FileNotFoundError:
+            print("npx not found — install Node.js to enable live MCP")
+            return False
+        except Exception as e:
+            print(f"MCP connection failed: {e}")
+            return False
+
+    def disconnect(self):
+        """Terminate MCP subprocess."""
+        if self._process:
+            self._process.terminate()
+            self._process = None
+            self._connected = False
+
+    def _next_id(self) -> int:
+        self._msg_id += 1
+        return self._msg_id
+
+    def _write_msg(self, msg: dict):
+        """Write a JSON-RPC message to the subprocess stdin."""
+        if not self._process or not self._process.stdin:
+            return
+        line = json.dumps(msg)
+        self._process.stdin.write(line + "\n")
+        self._process.stdin.flush()
+
+    def _read_msg(self) -> dict | None:
+        """Read a JSON-RPC response from the subprocess stdout."""
+        if not self._process or not self._process.stdout:
+            return None
+        try:
+            line = self._process.stdout.readline()
+            if line:
+                return json.loads(line.strip())
+        except (json.JSONDecodeError, OSError):
+            pass
+        return None
+
+    def _send_rpc(self, msg: dict, timeout: float = 10.0) -> dict | None:
+        """Send a JSON-RPC request and wait for matching response."""
+        import select
+        import time
+
+        self._write_msg(msg)
+        msg_id = msg.get("id")
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            if not self._process or not self._process.stdout:
+                return None
+            # Check if data available
+            ready, _, _ = select.select([self._process.stdout], [], [], 0.5)
+            if ready:
+                response = self._read_msg()
+                if response and response.get("id") == msg_id:
+                    return response
+                # Skip notifications
+        return None
+
+    def _execute_mcp(self, mcp_call: dict) -> dict:
+        """Execute a single MCP call via the mcp-remote subprocess."""
+        if not self._connected:
+            if not self.connect():
+                return {"status": "error", "message": "MCP not connected"}
+
+        rpc_msg = {
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": mcp_call["method"],
+            "params": mcp_call["params"],
         }
+
+        try:
+            response = self._send_rpc(rpc_msg)
+            if response is None:
+                # Connection may have died, try reconnecting once
+                self.disconnect()
+                if not self.connect():
+                    return {"status": "error", "message": "MCP reconnection failed"}
+                response = self._send_rpc(rpc_msg)
+
+            if response is None:
+                return {"status": "error", "message": "MCP timeout", "mcp_call": mcp_call}
+
+            if "error" in response:
+                return {
+                    "status": "mcp_error",
+                    "error": response["error"],
+                    "mcp_call": mcp_call,
+                }
+            return {
+                "status": "success",
+                "result": response.get("result"),
+                "mcp_call": mcp_call,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e), "mcp_call": mcp_call}
 
     def should_fallback(self, model_output: dict, confidence: float) -> bool:
         """Determine if this request should fall back to Claude API."""

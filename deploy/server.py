@@ -71,6 +71,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_completions()
         elif self.path == "/v1/asms/switch":
             self._switch_checkpoint()
+        elif self.path == "/v1/asms/connect":
+            self._connect_mcp()
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -129,17 +131,27 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         assistant_content = "\n\n".join(content_parts) if content_parts else result["_inference"]["raw_output"]
 
-        # Validate tool calls if bridge is available
+        # Execute tool calls against Keyflow MCP if live mode
+        live_mode = body.get("asms_live", False)
+        mcp_results = []
         validation_notes = []
+
         if BRIDGE and result.get("tool_calls"):
             for tc in result["tool_calls"]:
                 if not tc.get("parse_error"):
                     valid, msg = BRIDGE.validate_tool_call(tc)
                     if not valid:
                         validation_notes.append(f"Invalid: {msg}")
+                    elif live_mode:
+                        mcp_call = BRIDGE.format_mcp_call(tc)
+                        mcp_result = BRIDGE._execute_mcp(mcp_call)
+                        mcp_results.append(mcp_result)
 
         if validation_notes:
             assistant_content += "\n\n**Validation warnings:**\n" + "\n".join(f"- {n}" for n in validation_notes)
+
+        if mcp_results:
+            assistant_content += "\n\n**MCP Results:**\n```json\n" + json.dumps(mcp_results, indent=2) + "\n```"
 
         # Fallback notice
         if confidence < 0.85:
@@ -174,6 +186,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "methodology_notes": result.get("methodology_notes", {}),
                     "confidence": confidence,
                     "latency_ms": result["_inference"]["latency_ms"],
+                    "live_mode": live_mode,
+                    "mcp_results": mcp_results if mcp_results else None,
                 },
             })
 
@@ -299,6 +313,24 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             self._send_json(500, {"error": str(e)})
+
+    def _connect_mcp(self):
+        """Connect to Keyflow MCP (may trigger OAuth in browser)."""
+        if not BRIDGE:
+            self._send_json(400, {"status": "error", "message": "Bridge not loaded"})
+            return
+        ok = BRIDGE.connect()
+        if ok:
+            self._send_json(200, {
+                "status": "connected",
+                "endpoint": BRIDGE.endpoint_url,
+            })
+        else:
+            self._send_json(200, {
+                "status": "auth_needed",
+                "message": "OAuth authorization required — check the terminal for the auth URL",
+                "endpoint": BRIDGE.endpoint_url,
+            })
 
     def _read_body(self) -> dict | None:
         content_length = int(self.headers.get("Content-Length", 0))

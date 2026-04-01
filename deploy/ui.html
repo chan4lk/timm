@@ -74,6 +74,7 @@
   <div class="status" id="status"></div>
   <h1>ASMS <span>Micro-Model Tester</span></h1>
   <div class="model-info" id="modelInfo">--</div>
+  <button id="mcpBtn" onclick="connectMcp()" style="background:var(--bg);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:11px;font-family:inherit;cursor:pointer;white-space:nowrap;">Connect MCP</button>
   <div class="model-select">
     <label>Checkpoint:</label>
     <select id="modelSelect"></select>
@@ -89,6 +90,9 @@
 <div class="chat" id="chat"></div>
 
 <div class="input-area">
+  <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);cursor:pointer;white-space:nowrap;">
+    <input type="checkbox" id="liveToggle"> <span id="liveLabel">Dry run</span>
+  </label>
   <textarea id="input" placeholder="Ask the OKR agent..." rows="1"></textarea>
   <button id="send" onclick="sendMessage()">Send</button>
 </div>
@@ -98,6 +102,13 @@ const BASE = window.location.origin;
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
+const liveToggle = document.getElementById('liveToggle');
+const liveLabel = document.getElementById('liveLabel');
+
+liveToggle.addEventListener('change', () => {
+  liveLabel.textContent = liveToggle.checked ? 'Live MCP' : 'Dry run';
+  liveLabel.style.color = liveToggle.checked ? 'var(--green)' : 'var(--muted)';
+});
 const status = document.getElementById('status');
 const modelInfo = document.getElementById('modelInfo');
 const modelSelect = document.getElementById('modelSelect');
@@ -238,6 +249,19 @@ function addAsmsPanel(msgDiv, asms) {
     panel.appendChild(tc);
   }
 
+  // MCP results
+  if (asms.mcp_results && asms.mcp_results.length > 0) {
+    const modeTag = `<span class="tag green">LIVE</span>`;
+    panel.innerHTML += `<div class="row"><span class="label">MCP</span>${modeTag}</div>`;
+    const mc = document.createElement('div');
+    mc.className = 'tool-calls';
+    mc.style.borderColor = 'var(--green)';
+    mc.textContent = JSON.stringify(asms.mcp_results, null, 2);
+    panel.appendChild(mc);
+  } else if (asms.live_mode === false) {
+    panel.innerHTML += `<div class="row"><span class="label">MCP</span><span class="tag yellow">DRY RUN</span></div>`;
+  }
+
   // Methodology
   if (asms.methodology_notes && Object.keys(asms.methodology_notes).length > 0) {
     panel.innerHTML += `<div class="row"><span class="label">Methodology</span><span class="value">${JSON.stringify(asms.methodology_notes)}</span></div>`;
@@ -268,6 +292,7 @@ async function sendMessage() {
           {role: 'user', content: query},
         ],
         temperature: 0.1,
+        asms_live: liveToggle.checked,
       }),
     });
 
@@ -310,6 +335,31 @@ function addStarters() {
     div.appendChild(btn);
   }
   chat.appendChild(div);
+}
+
+async function connectMcp() {
+  const btn = document.getElementById('mcpBtn');
+  btn.textContent = 'Connecting...';
+  btn.style.color = 'var(--yellow)';
+  try {
+    const r = await fetch(BASE + '/v1/asms/connect', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const d = await r.json();
+    if (d.status === 'connected') {
+      btn.textContent = 'MCP Connected';
+      btn.style.color = 'var(--green)';
+      btn.style.borderColor = 'var(--green)';
+      addSystemMsg('Connected to Keyflow MCP at ' + d.endpoint);
+    } else {
+      btn.textContent = 'Auth Needed';
+      btn.style.color = 'var(--yellow)';
+      btn.style.borderColor = 'var(--yellow)';
+      addSystemMsg('OAuth required — check the terminal for the authorization URL, then click Connect MCP again');
+    }
+  } catch (e) {
+    btn.textContent = 'MCP Error';
+    btn.style.color = 'var(--red)';
+    addSystemMsg('MCP connection failed: ' + e.message);
+  }
 }
 
 // Init
