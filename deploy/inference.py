@@ -70,7 +70,7 @@ class OKRInference:
         query: str,
         session_context: dict | None = None,
         max_tokens: int = 256,
-        temperature: float = 0.1,
+        temperature: float = 0.0,
     ) -> dict:
         """Run inference and return parsed tool calls."""
         start = time.perf_counter()
