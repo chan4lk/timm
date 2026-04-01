@@ -9,9 +9,9 @@ Includes:
 """
 
 import json
-import subprocess
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -46,10 +46,13 @@ class KeyflowBridge:
             if arg == "--header" and i + 1 < len(args):
                 self.auth_header = args[i + 1]
 
-        # MCP subprocess state
-        self._process = None
+        # MCP session state
         self._connected = False
         self._msg_id = 0
+        self._session_id = None
+        self._access_token = None
+        self._client_id = None
+        self._client_secret = None
 
         if self.endpoint_url:
             print(f"Keyflow MCP endpoint: {self.endpoint_url}")
@@ -132,82 +135,67 @@ class KeyflowBridge:
         return results
 
     def connect(self) -> bool:
-        """Spawn mcp-remote subprocess and initialize MCP session.
+        """Connect to Keyflow MCP via direct HTTP (Streamable HTTP transport).
 
-        The Keyflow MCP server uses OAuth. On first connection, mcp-remote
-        will print an auth URL to stderr. The user must visit that URL in
-        a browser to authorize. After auth, the connection completes.
+        Uses OAuth client_credentials grant to get a fresh access token,
+        then initializes an MCP session over HTTP+SSE.
         """
-        if self._process and self._process.poll() is None:
-            return True  # already connected
+        if self._connected and self._session_id:
+            return True
 
         if not self.endpoint_url:
             print("No Keyflow MCP endpoint configured")
             return False
 
-        cmd = ["npx", "mcp-remote", self.endpoint_url]
-        if self.auth_header:
-            cmd += ["--header", self.auth_header]
-
         try:
-            self._process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+            # Step 1: Discover OAuth endpoints
+            discovery_url = self.endpoint_url.rsplit("/api/mcp", 1)[0]
+            req = urllib.request.Request(
+                f"{discovery_url}/.well-known/oauth-authorization-server"
             )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                oauth_config = json.loads(resp.read().decode())
 
-            # mcp-remote needs time to discover OAuth and start the flow
-            import os
-            import time
-            import webbrowser
+            token_endpoint = oauth_config["token_endpoint"]
+            registration_endpoint = oauth_config.get("registration_endpoint")
 
-            os.set_blocking(self._process.stderr.fileno(), False)
-            os.set_blocking(self._process.stdout.fileno(), False)
+            # Step 2: Register a client if we don't have credentials
+            if not self._client_id:
+                reg_body = json.dumps({
+                    "client_name": "ASMS Bridge",
+                    "grant_types": ["client_credentials"],
+                    "scope": "mcp:read mcp:write",
+                    "token_endpoint_auth_method": "client_secret_post",
+                }).encode()
+                req = urllib.request.Request(
+                    registration_endpoint, data=reg_body,
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    client_info = json.loads(resp.read().decode())
+                self._client_id = client_info["client_id"]
+                self._client_secret = client_info["client_secret"]
+                print(f"Registered OAuth client: {self._client_id}")
 
-            # Wait for mcp-remote to be ready (may need OAuth)
-            auth_url = None
-            start = time.time()
-            while time.time() - start < 15:
-                try:
-                    line = self._process.stderr.readline()
-                    if line:
-                        line = line.strip()
-                        if "authorize" in line.lower() and "http" in line:
-                            # Extract URL from the line
-                            for part in line.split():
-                                if part.startswith("http"):
-                                    auth_url = part
-                                    break
-                            if not auth_url and ":\n" not in line:
-                                # URL might be on next line
-                                next_line = self._process.stderr.readline().strip()
-                                if next_line.startswith("http"):
-                                    auth_url = next_line
-                            if auth_url:
-                                print(f"\n{'='*50}")
-                                print("  Keyflow MCP requires OAuth authorization.")
-                                print(f"  Opening browser to: {auth_url[:80]}...")
-                                print(f"{'='*50}\n")
-                                webbrowser.open(auth_url)
-                        elif "connected" in line.lower() or "ready" in line.lower():
-                            break
-                except (IOError, OSError):
-                    pass
-                time.sleep(0.5)
+            # Step 3: Get access token via client_credentials
+            token_body = urllib.parse.urlencode({
+                "grant_type": "client_credentials",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "scope": "mcp:read mcp:write",
+            }).encode()
+            req = urllib.request.Request(
+                token_endpoint, data=token_body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                token_data = json.loads(resp.read().decode())
+            self._access_token = token_data["access_token"]
+            print(f"OAuth token acquired (expires in {token_data.get('expires_in', '?')}s)")
 
-            # Restore blocking mode for normal operation
-            os.set_blocking(self._process.stdout.fileno(), True)
-
-            # Wait a bit for OAuth callback if auth was needed
-            if auth_url:
-                print("Waiting for OAuth authorization (up to 60s)...")
-                time.sleep(5)  # give user time to authorize
-
-            # Send initialize request
-            init_msg = {
+            # Step 4: Initialize MCP session
+            init_body = json.dumps({
                 "jsonrpc": "2.0",
                 "id": self._next_id(),
                 "method": "initialize",
@@ -216,116 +204,117 @@ class KeyflowBridge:
                     "capabilities": {},
                     "clientInfo": {"name": "asms-bridge", "version": "1.0"},
                 },
-            }
-            response = self._send_rpc(init_msg, timeout=30)
-            if response and "result" in response:
-                # Send initialized notification
-                self._write_msg({"jsonrpc": "2.0", "method": "notifications/initialized"})
-                server_info = response["result"].get("serverInfo", {})
-                print(f"MCP session established: {server_info}")
-                self._connected = True
-                return True
-            else:
-                print(f"MCP init failed: {response}")
-                if auth_url:
-                    print("Did you complete the OAuth authorization in the browser?")
-                self.disconnect()
-                return False
-        except FileNotFoundError:
-            print("npx not found — install Node.js to enable live MCP")
-            return False
+            }).encode()
+            req = urllib.request.Request(
+                self.endpoint_url, data=init_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Accept": "application/json, text/event-stream",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                # Extract session ID from headers
+                self._session_id = resp.headers.get("mcp-session-id")
+                body = resp.read().decode()
+                # Parse SSE response
+                for line in body.split("\n"):
+                    if line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        server_info = data.get("result", {}).get("serverInfo", {})
+                        print(f"MCP connected: {server_info.get('name')} v{server_info.get('version')}")
+                        break
+
+            # Step 5: Send initialized notification
+            notif_body = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            }).encode()
+            try:
+                req = urllib.request.Request(
+                    self.endpoint_url, data=notif_body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self._access_token}",
+                        "Mcp-Session-Id": self._session_id,
+                        "Accept": "application/json",
+                    },
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=5)
+            except urllib.error.HTTPError:
+                pass  # Some servers don't accept notification POSTs
+
+            self._connected = True
+            return True
+
         except Exception as e:
             print(f"MCP connection failed: {e}")
+            self._connected = False
             return False
 
     def disconnect(self):
-        """Terminate MCP subprocess."""
-        if self._process:
-            self._process.terminate()
-            self._process = None
-            self._connected = False
+        """Clear MCP session."""
+        self._connected = False
+        self._session_id = None
+        self._access_token = None
 
     def _next_id(self) -> int:
         self._msg_id += 1
         return self._msg_id
 
-    def _write_msg(self, msg: dict):
-        """Write a JSON-RPC message to the subprocess stdin."""
-        if not self._process or not self._process.stdin:
-            return
-        line = json.dumps(msg)
-        self._process.stdin.write(line + "\n")
-        self._process.stdin.flush()
-
-    def _read_msg(self) -> dict | None:
-        """Read a JSON-RPC response from the subprocess stdout."""
-        if not self._process or not self._process.stdout:
-            return None
-        try:
-            line = self._process.stdout.readline()
-            if line:
-                return json.loads(line.strip())
-        except (json.JSONDecodeError, OSError):
-            pass
-        return None
-
-    def _send_rpc(self, msg: dict, timeout: float = 10.0) -> dict | None:
-        """Send a JSON-RPC request and wait for matching response."""
-        import select
-        import time
-
-        self._write_msg(msg)
-        msg_id = msg.get("id")
-        deadline = time.time() + timeout
-
-        while time.time() < deadline:
-            if not self._process or not self._process.stdout:
-                return None
-            # Check if data available
-            ready, _, _ = select.select([self._process.stdout], [], [], 0.5)
-            if ready:
-                response = self._read_msg()
-                if response and response.get("id") == msg_id:
-                    return response
-                # Skip notifications
-        return None
-
     def _execute_mcp(self, mcp_call: dict) -> dict:
-        """Execute a single MCP call via the mcp-remote subprocess."""
+        """Execute a single MCP tool call via HTTP."""
         if not self._connected:
             if not self.connect():
                 return {"status": "error", "message": "MCP not connected"}
 
-        rpc_msg = {
+        rpc_body = json.dumps({
             "jsonrpc": "2.0",
             "id": self._next_id(),
             "method": mcp_call["method"],
             "params": mcp_call["params"],
-        }
+        }).encode()
 
         try:
-            response = self._send_rpc(rpc_msg)
-            if response is None:
-                # Connection may have died, try reconnecting once
+            req = urllib.request.Request(
+                self.endpoint_url, data=rpc_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Mcp-Session-Id": self._session_id,
+                    "Accept": "application/json, text/event-stream",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode()
+                # Parse SSE or plain JSON response
+                for line in body.split("\n"):
+                    if line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        if "error" in data:
+                            return {"status": "mcp_error", "error": data["error"], "mcp_call": mcp_call}
+                        return {"status": "success", "result": data.get("result"), "mcp_call": mcp_call}
+                # Fallback: try plain JSON
+                try:
+                    data = json.loads(body)
+                    if "error" in data:
+                        return {"status": "mcp_error", "error": data["error"], "mcp_call": mcp_call}
+                    return {"status": "success", "result": data.get("result"), "mcp_call": mcp_call}
+                except json.JSONDecodeError:
+                    return {"status": "error", "message": f"Unparseable response: {body[:200]}", "mcp_call": mcp_call}
+
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                # Token expired, reconnect
                 self.disconnect()
-                if not self.connect():
-                    return {"status": "error", "message": "MCP reconnection failed"}
-                response = self._send_rpc(rpc_msg)
-
-            if response is None:
-                return {"status": "error", "message": "MCP timeout", "mcp_call": mcp_call}
-
-            if "error" in response:
-                return {
-                    "status": "mcp_error",
-                    "error": response["error"],
-                    "mcp_call": mcp_call,
-                }
-            return {
-                "status": "success",
-                "result": response.get("result"),
-                "mcp_call": mcp_call,
-            }
+                if self.connect():
+                    return self._execute_mcp(mcp_call)
+                return {"status": "error", "message": "Token refresh failed", "mcp_call": mcp_call}
+            body = e.read().decode() if e.fp else ""
+            return {"status": "http_error", "code": e.code, "message": body[:500], "mcp_call": mcp_call}
         except Exception as e:
             return {"status": "error", "message": str(e), "mcp_call": mcp_call}
 
