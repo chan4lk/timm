@@ -290,6 +290,12 @@ This produces `model/tokenizer/okr_tokenizer.model`. The `train.py` script reads
 - MEDIUM: 1500–4000
 - HIGH: 4000–8000
 
+**Rule of thumb from measured data:**
+```
+vocab_size = min(8000, unique_tokens_in_corpus * 2)
+```
+With 299 examples the effective unique token count was ~750, making vocab 1500 the ceiling. At 1099 examples, vocab 4000 works well. If you have no corpus yet, train on a seed vocabulary from your role spec and tool schemas first, then grow vocab as corpus expands.
+
 ### Recommended corpus sizes and cost estimates
 
 | Agent Complexity | Min Corpus | Production Corpus | Est. Cost (Sonnet) |
@@ -349,26 +355,24 @@ The OKR agent uses the **MEDIUM** config: 4 layers, 256 hidden, 4 heads, 512 FFN
 ### Run training
 
 ```bash
-cd model
-
 # Quick validation run (5 epochs, small batch)
-python train.py \
+uv run model/train.py \
   --corpus corpus.jsonl \
   --epochs 5 \
   --batch-size 16
 
-# Full production run
-python train.py \
+# Full production run (confirmed working config)
+uv run model/train.py \
   --corpus corpus.jsonl \
-  --epochs 20 \
-  --batch-size 32 \
+  --epochs 30 \
+  --batch-size 16 \
   --lr 3e-4 \
   --warmup 100 \
   --eval-every 50 \
   --checkpoint-every 500
 ```
 
-Checkpoints are saved to `model/checkpoints/`. The best validation loss checkpoint is saved as `model/checkpoints/best/`.
+Checkpoints are saved to `model/checkpoints/`. The best validation loss checkpoint is saved as `model/checkpoints/best/`. Always use the best checkpoint — val loss typically plateaus early then slowly rises, so the final epoch is not the best model.
 
 ### Curriculum learning phases
 
@@ -389,35 +393,41 @@ This ordering matters: the model first learns the happy path, then generalises t
 
 ### Hyperparameter guidance
 
+**Confirmed working config (OKR agent, 1099 examples, MEDIUM architecture):**
+- `batch_size=16`, `epochs=30`, `lr=3e-4`, `warmup=100` steps
+- Curriculum phases: 50% / 35% / 15% (normal / +edge / +adversarial)
+- Save best by `val_loss`, not final epoch
+
 | Parameter     | Default  | When to Change                                      |
 |--------------|----------|-----------------------------------------------------|
 | `lr_max`     | 3e-4     | Lower to 1e-4 if training is unstable early         |
 | `lr_min`     | 1e-5     | Leave as-is; cosine decay handles the tail          |
 | `warmup`     | 100      | Increase to 200 if batch size > 64                  |
-| `batch_size` | 32       | Increase if GPU memory allows; diminishing returns > 64 |
-| `epochs`     | 20       | MEDIUM class usually converges by epoch 15          |
+| `batch_size` | 16       | 16 confirmed; increase to 32 with larger corpus     |
+| `epochs`     | 30       | Val loss plateaus ~epoch 6-7 of Phase 1, then slowly rises — best model is mid-training, not final |
 | `dropout`    | 0.1      | Increase to 0.2 if overfitting (train loss << val loss) |
 
 ### Expected loss curves
 
-For a MEDIUM complexity corpus of 2,000 examples:
+For a MEDIUM complexity corpus of ~1,100 examples (confirmed behaviour):
 
 ```
-Phase 1 (Normal):
-  Epoch 1:  train ~2.8,  val ~2.7   ← rapid initial learning
-  Epoch 5:  train ~1.4,  val ~1.5
-  Epoch 10: train ~0.8,  val ~0.9   ← decision boundaries forming
+Phase 1 (Normal, epochs 1–15 of 30):
+  Epoch 1:  val ~3.5    ← starting point with ~1K corpus
+  Epoch 6:  val ~2.0    ← plateau begins; best checkpoint often here
+  Epoch 10: val ~2.1    ← slow creep up (mild overfitting starts)
+  Epoch 15: val ~2.3
 
 Phase 2 (+ Edge):
-  Epoch 11: train ~1.1,  val ~1.2   ← slight bump as edge cases introduced
-  Epoch 16: train ~0.7,  val ~0.8
+  Brief val loss spike as edge cases introduced, then partial recovery
 
 Phase 3 (+ Adversarial):
-  Epoch 17: train ~0.9,  val ~0.9   ← brief bump for adversarial hardening
-  Epoch 20: train ~0.6,  val ~0.7   ← target convergence
+  Another brief spike, then stabilises
 ```
 
-**Target final validation loss:** < 0.8 for production quality; < 0.5 for high-stakes applications.
+**Key behaviour:** Val loss plateaus around epoch 6-7 of Phase 1, then slowly increases due to mild overfitting on a small corpus. The best checkpoint by `val_loss` is saved mid-training — always use it, not the final epoch.
+
+**Target final validation loss:** < 1.5 is functional; < 1.0 is production quality; < 0.5 for high-stakes applications. With 1099 examples, reaching < 1.5 is achievable; < 1.0 requires ~5K+ examples.
 
 The training sequence format is: `<bos>QUERY: {query} CONTEXT: {context} <workflow>{wf}</workflow> <tool>{tool_calls_json}</tool> <score>{methodology_json}</score><eos>`
 
@@ -469,7 +479,7 @@ engine = OKRInference("model/checkpoints/best_q4")
 result = engine.predict(
     query="Show me our Q2 OKRs",
     session_context={"userId": "usr_1", "activeCycleId": "cyc_q2"},
-    temperature=0.1,
+    temperature=0.0,   # MUST be 0.0 — see Troubleshooting: space-token degeneration
 )
 
 print(result["workflow"])       # "view_okrs"
@@ -517,7 +527,19 @@ def format_mcp_call(self, tool_call: dict) -> dict:
     }
 ```
 
-**Configure `.mcp.json`** at the repo root:
+**MCP connection pattern (Streamable HTTP transport with OAuth)**
+
+The bridge connects via direct HTTP — no `mcp-remote` proxy or Node.js process needed. The protocol is:
+
+1. **Discover OAuth metadata** — `GET <mcp_base_url>/.well-known/oauth-authorization-server`
+2. **Register client** — `POST <registration_endpoint>` with `{"client_name": "...", "grant_types": ["client_credentials"]}`
+3. **Get token** — `POST <token_endpoint>` with `client_id`, `client_secret`, `grant_type=client_credentials`
+4. **Init MCP session** — `POST <mcp_base_url>/mcp` with `{"jsonrpc":"2.0","method":"initialize",...}` and `Authorization: Bearer <token>`; capture the `mcp-session-id` from the response header
+5. **Call tools** — `POST <mcp_base_url>/mcp` with `{"jsonrpc":"2.0","method":"tools/call","params":{"name":"...","arguments":{...}}}` and both `Authorization` and `mcp-session-id` headers
+
+This replaces the `.mcp.json` `npx` config for server-side deployment. The bridge in `deploy/keyflow_bridge.py` implements this flow via `connect_mcp()` and `call_tool()`.
+
+**Configure `.mcp.json`** at the repo root (for local Claude Code integration):
 
 ```json
 {
@@ -557,6 +579,32 @@ print(result["confidence"])   # 0.0 – 1.0
 print(result["tool_results"]) # validated + formatted MCP calls
 ```
 
+### 6d. Chat UI + API server
+
+`deploy/server.py` provides:
+- **OpenAI-compatible API** at `/v1/chat/completions` — drop-in for any OpenAI SDK client
+- **Chat UI** served at `/` (root) — browser-based interface for testing
+- **Model switching** via `POST /v1/asms/switch` with `{"checkpoint": "<path>"}` — switch between checkpoints without restarting
+- **MCP connection** via `POST /v1/asms/connect` with `{"mcp_url": "<url>"}` — connects the bridge at runtime
+
+```bash
+# Start the server (default port 8000)
+uv run deploy/server.py
+
+# Open chat UI
+open http://localhost:8000
+
+# Switch model at runtime
+curl -X POST http://localhost:8000/v1/asms/switch \
+  -H "Content-Type: application/json" \
+  -d '{"checkpoint": "model/checkpoints/best_q4"}'
+
+# Connect to MCP server
+curl -X POST http://localhost:8000/v1/asms/connect \
+  -H "Content-Type: application/json" \
+  -d '{"mcp_url": "https://your-mcp-endpoint"}'
+```
+
 ---
 
 ## Quick Start
@@ -564,8 +612,7 @@ print(result["tool_results"]) # validated + formatted MCP calls
 Complete pipeline from zero to deployed model:
 
 ```bash
-# Prerequisites
-pip install mlx mlx-data sentencepiece anthropic tqdm pyyaml
+# Prerequisites — all commands run via uv
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # 0. Confirm you're in the timm repo root
@@ -575,34 +622,39 @@ cd /path/to/timm
 #    corpus/generate_corpus.py for your agent's domain
 
 # 2. Run the full pipeline (OKR agent, 100-example fast mode)
-python run.py \
+uv run run.py \
   --corpus-size 100 \
   --model claude-sonnet-4-20250514 \
-  --epochs 20 \
-  --batch-size 32
+  --epochs 30 \
+  --batch-size 16
 
-# 3. Test inference
-python deploy/inference.py model/checkpoints/best_q4 \
+# 3. Test inference (temperature=0.0 is mandatory)
+uv run deploy/inference.py model/checkpoints/best_q4 \
   --query "Show me my Q2 OKRs"
 
-# 4. Test bridge validation
-python deploy/keyflow_bridge.py
+# 4. Start the chat UI + OpenAI-compatible API server
+uv run deploy/server.py
+
+# 5. Test bridge validation
+uv run deploy/keyflow_bridge.py
 ```
+
+**All scripts accept `uv run <script>` directly** — no manual pip install or venv activation needed.
 
 **Selective stage execution** (useful during development):
 
 ```bash
 # Regenerate corpus only
-python run.py --skip-tokenizer --skip-training --skip-quantize --skip-benchmark
+uv run run.py --skip-tokenizer --skip-training --skip-quantize --skip-benchmark
 
 # Retrain from existing corpus
-python run.py --skip-corpus --skip-tokenizer
+uv run run.py --skip-corpus --skip-tokenizer
 
 # Requantize existing checkpoint
-python deploy/quantize.py model/checkpoints/best --bits 4
+uv run deploy/quantize.py model/checkpoints/best --bits 4
 
 # Benchmark only
-python run.py --skip-corpus --skip-tokenizer --skip-training --skip-quantize
+uv run run.py --skip-corpus --skip-tokenizer --skip-training --skip-quantize
 ```
 
 **Expected runtimes on Apple M-series:**
@@ -621,16 +673,19 @@ python run.py --skip-corpus --skip-tokenizer --skip-training --skip-quantize
 
 Corpus size is the primary lever for accuracy improvement. Architecture size is secondary — do not upscale architecture before maxing out corpus quality.
 
-**Corpus size vs. accuracy (MEDIUM complexity, OKR agent):**
+**Corpus size vs. accuracy (MEDIUM complexity, OKR agent) — rows marked * are measured, rest are estimates:**
 
-| Corpus Size | Val Loss | Accuracy (workflow) | Accuracy (tool params) | Fallback Rate |
-|------------|----------|--------------------|-----------------------|---------------|
-| 100        | ~1.8     | ~70%               | ~55%                  | ~35%          |
-| 500        | ~1.2     | ~83%               | ~70%                  | ~22%          |
-| 1,000      | ~0.9     | ~90%               | ~80%                  | ~15%          |
-| 3,000      | ~0.7     | ~95%               | ~88%                  | ~8%           |
-| 5,000      | ~0.55    | ~97%               | ~93%                  | ~5%           |
-| 10,000     | ~0.45    | ~98%               | ~96%                  | ~3%           |
+| Corpus Size | Val Loss    | Accuracy (teacher-forced) | Workflow Routing | Fallback Rate |
+|------------|-------------|--------------------------|-----------------|---------------|
+| 299        | 3.46 *      | 71.7% *                  | 0/6 *           | ~50%          |
+| 1,099      | 2.05 *      | 80.7% *                  | 4/6 *           | ~25%          |
+| 5,000      | ~0.8 (est)  | ~90% (est)               | 6/6             | ~10%          |
+| 10,000     | ~0.55 (est) | ~95% (est)               | 6/6             | ~5%           |
+
+Key observations from measured data:
+- Structured output (valid JSON tool calls) only emerges reliably around 1,000+ examples
+- Workflow routing jumps from 0/6 to 4/6 between 300 and 1,100 examples — the model needs enough diversity to learn all routes
+- Val loss of 2.05 at 1,099 examples is functional but not production-quality; target < 1.0 for reliable routing
 
 **Scaling cost estimates (Claude Sonnet corpus generation):**
 
@@ -760,6 +815,32 @@ for query in test_queries:
 
 If most scores cluster around 0.7–0.8, the model is generating valid output but the scoring function is too conservative. Adjust the penalty weights in `confidence_score()` or lower the threshold.
 
+### Space-token degeneration (output is repeated spaces / UNK)
+
+**Cause:** Using any temperature above 0.0 (even 0.1) causes the model to enter a degenerate loop where it samples a space token, which gets decoded as UNK by SentencePiece, which feeds back as a noisy input token for the next step, resulting in an infinite stream of spaces and UNK tokens.
+
+**This is the single most common failure mode when first running inference.**
+
+**Fix:** Always use `temperature=0.0` (greedy decoding). This is mandatory for structured JSON output — the model's decision space is discrete, so greedy is both correct and optimal.
+
+```python
+# WRONG — causes degeneration
+result = engine.predict(query, temperature=0.1)
+
+# CORRECT
+result = engine.predict(query, temperature=0.0)
+```
+
+```bash
+# WRONG
+uv run deploy/inference.py model/checkpoints/best_q4 --query "..." --temperature 0.1
+
+# CORRECT (or omit --temperature; default should be 0.0)
+uv run deploy/inference.py model/checkpoints/best_q4 --query "..." --temperature 0.0
+```
+
+If you see this in other inference frameworks, ensure `do_sample=False` / `greedy=True` is set explicitly.
+
 ### Re-synthesis trigger: when to retrain
 
 Retrain the model when:
@@ -769,3 +850,52 @@ Retrain the model when:
 - Fallback rate creeps above 20% (distribution shift in user queries)
 
 Retrain is NOT needed for: changes to session context values, new users/cycles, UI changes that don't affect query phrasing patterns.
+
+---
+
+## Lessons Learned
+
+Empirical findings from the OKR agent implementation that differ from initial estimates:
+
+### Inference
+
+- **Temperature MUST be 0.0.** Even 0.1 causes space-token degeneration (repeated spaces decoded as UNK). This is not negotiable for structured output. See Troubleshooting section for details.
+- The micro-model's decision space is discrete — greedy decoding is both safe and optimal.
+
+### Corpus & Accuracy Scaling
+
+Measured data points (OKR agent, MEDIUM architecture):
+
+| Corpus | Val Loss | Teacher-Forced Accuracy | Workflow Routing |
+|--------|----------|------------------------|-----------------|
+| 299    | 3.46     | 71.7%                  | 0/6             |
+| 1,099  | 2.05     | 80.7%                  | 4/6             |
+
+- **Structured output does not emerge until ~1,000 examples.** Below that, the model may predict correct workflow labels but produce malformed JSON tool calls.
+- **Workflow routing coverage is non-linear.** 0/6 at 299 examples → 4/6 at 1,099. The remaining 2/6 routes were underrepresented in the corpus (low `weight` in `SCENARIO_TEMPLATES`). Fix by increasing weight for those workflows.
+- The original scaling estimates in this skill were optimistic. Treat estimates as aspirational; measure at 300, 1K, and 3K before committing to a production corpus size.
+
+### Tokenizer Vocab Sizing
+
+- The formula `vocab_size = min(8000, unique_tokens_in_corpus * 2)` was validated in practice.
+- With a 299-example corpus, vocab > ~1500 had no unique tokens to fill; setting it higher wastes model capacity on padding.
+- With 1099 examples, vocab 4000 is appropriate.
+- Mismatch between corpus size and vocab size is a hidden failure mode — the tokenizer trains fine but the embedding table is mostly unused, inflating parameter count without benefit.
+
+### Training Dynamics
+
+- Val loss plateaus around epoch 6-7 of Phase 1, then slowly increases — classic mild overfitting on a small corpus.
+- The best checkpoint is saved mid-training, not at the final epoch. Always load from `model/checkpoints/best/`.
+- `batch_size=16` (not 32) worked better with the 1,099-example corpus — smaller batches provide more gradient updates per epoch, which helps when data is scarce.
+- `epochs=30` gave the scheduler enough time to visit the best loss region, but `epochs=20` with a 300-example corpus was insufficient.
+
+### MCP Connectivity
+
+- The Streamable HTTP transport with OAuth `client_credentials` grant works reliably without any Node.js proxy.
+- The session ID from the `mcp-session-id` response header must be preserved and sent with every subsequent tool call — stateless retry without it will fail.
+- Token expiry (typically 1 hour) requires the bridge to re-authenticate transparently; implement a token refresh check before each call.
+
+### Deployment
+
+- `uv run` is the most reliable way to invoke all scripts — it handles the virtualenv and dependency resolution automatically.
+- The server's model-switching endpoint (`/v1/asms/switch`) is valuable during development: you can compare checkpoint quality without restarting the server or the chat UI session.

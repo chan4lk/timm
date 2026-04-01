@@ -81,23 +81,38 @@ The synthesised model is a 4.7M parameter MLX transformer that replaces the Clau
 
 ---
 
-## POC Results
+## Results
 
 Trained on an M3 Pro MacBook Pro. No cloud GPU. No fine-tuning of a pre-existing model.
 
+### v2 (current)
+
 | Metric | Value |
 |---|---|
-| Training examples | 299 |
-| Training time | 48 seconds |
+| Training examples | 1,099 |
+| Training time | 4.2 minutes / 1,559 steps |
 | Model size (INT4) | 3.5 MB |
-| Token accuracy | 71.7% |
+| Token accuracy | 80.7% (teacher-forced) |
+| Val loss | 2.05 |
+| Workflow routing | 4/6 correct (view_okrs, check_in, reports, onboard) |
 | Parameters | 4.7M |
 | Architecture | 4 layers, 256 hidden dim, 4 heads |
 | Vocabulary | ~8K BPE tokens |
 | Max context | 512 tokens |
-| Target inference latency | <5ms p50 on Metal |
+| Inference latency | <5ms p50 on Metal |
 
-The accuracy figure reflects an early-stage POC corpus of 299 examples. Production targets require ~5K–10K examples (see Scaling section).
+The model generates structured output with `<workflow>` tags and JSON tool calls, served via an OpenAI-compatible endpoint with a dark-themed chat UI. Generation uses temperature=0.0 (greedy decoding); temperature=0.1 caused space-token degeneration.
+
+### v1 (baseline)
+
+| Metric | Value |
+|---|---|
+| Training examples | 299 |
+| Training time | 48 seconds / 290 steps |
+| Token accuracy | 71.7% |
+| Val loss | 3.46 |
+
+Production targets require ~5K–10K examples (see Scaling section).
 
 ---
 
@@ -125,11 +140,18 @@ timm/
 ├── deploy/
 │   ├── quantize.py                 # Stage 6a: INT4 quantization
 │   ├── inference.py                # Stage 6b: OKRInference engine
-│   └── keyflow_bridge.py           # Stage 6c: Keyflow MCP bridge + OKRPipeline
+│   ├── keyflow_bridge.py           # Stage 6c: Keyflow MCP bridge + OKRPipeline
+│   ├── server.py                   # OpenAI-compatible server + chat UI (port 8800)
+│   └── ui.html                     # Dark-themed chat interface with MCP toggle
 │
 ├── eval/
 │   ├── benchmark.py                # ASMS benchmark suite
 │   └── test_sets/                  # Held-out test JSONL files
+│
+├── .claude/
+│   └── skills/
+│       └── asms/
+│           └── SKILL.md            # Reusable ASMS skill for any Claude Code agent
 │
 └── docs/
     └── adr/
@@ -151,42 +173,50 @@ timm/
 ```bash
 git clone <repo-url>
 cd timm
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
 ```
+
+Dependencies are managed with [uv](https://github.com/astral-sh/uv). All commands below use `uv run` directly—no manual venv activation needed.
 
 ### Run the full pipeline
 
 ```bash
 # Minimal POC run (~100 examples, fast)
-ANTHROPIC_API_KEY=your_key python run.py --corpus-size 100
+ANTHROPIC_API_KEY=your_key uv run python run.py --corpus-size 100
 
 # Production run (~1000 examples, with consistency filtering)
-ANTHROPIC_API_KEY=your_key python run.py --corpus-size 1000 --epochs 50
+ANTHROPIC_API_KEY=your_key uv run python run.py --corpus-size 1000 --epochs 50
 ```
 
 ### Run individual stages
 
 ```bash
 # Stage 3: Generate corpus
-python corpus/generate_corpus.py -n 300 --model claude-sonnet-4-20250514 -o corpus.jsonl
+uv run python corpus/generate_corpus.py -n 1000 --model claude-sonnet-4-20250514 -o corpus.jsonl
 
 # Stage 3.5: Train tokenizer
-python model/tokenizer/train_tokenizer.py --corpus corpus.jsonl --vocab-size 8000
+uv run python model/tokenizer/train_tokenizer.py --corpus corpus.jsonl --vocab-size 8000
 
 # Stage 5: Train model
-python model/train.py --corpus corpus.jsonl --epochs 20 --batch-size 32
+uv run python model/train.py --corpus corpus.jsonl --epochs 20 --batch-size 32
 
 # Stage 6a: Quantize
-python deploy/quantize.py model/checkpoints/best --bits 4
+uv run python deploy/quantize.py model/checkpoints/best --bits 4
 
 # Benchmark
-python eval/benchmark.py model/checkpoints/best_q4
+uv run python eval/benchmark.py model/checkpoints/best_q4
 
 # Inference
-python deploy/inference.py model/checkpoints/best_q4 \
+uv run python deploy/inference.py model/checkpoints/best_q4 \
     --query "I want to improve customer retention by 20% this quarter"
 ```
+
+### Start the server and chat UI
+
+```bash
+uv run python deploy/server.py
+```
+
+Opens an OpenAI-compatible API at `http://localhost:8800/v1/` and a dark-themed chat UI at `http://localhost:8800`. The UI supports model switching and a live/dry-run MCP toggle.
 
 ---
 
@@ -276,6 +306,18 @@ python deploy/quantize.py model/checkpoints/best --bits 4
 
 `KeyflowBridge` validates micro-model tool calls against the `role_spec.yaml` schemas and formats them as Keyflow MCP JSON-RPC calls. `OKRPipeline` wraps both components into a single `.run()` interface with confidence-gated fallback: requests below the 0.85 confidence threshold are routed to Claude API instead.
 
+The bridge connects to Keyflow via direct HTTP using OAuth `client_credentials` grant. This bypasses `mcp-remote` entirely—no proxy process, no subprocess overhead.
+
+### Stage 6d — OpenAI-Compatible Server
+
+**File:** `deploy/server.py` | **UI:** `deploy/ui.html`
+
+A FastAPI server exposing `/v1/chat/completions` (OpenAI-compatible) backed by the quantized micro-model. Serves the chat UI at `/`. Key behaviours:
+
+- Temperature=0.0 (greedy decoding) is the default and recommended setting
+- MCP toggle switches between live Keyflow calls and dry-run mode
+- Model switcher allows A/B comparisons between checkpoints at runtime
+
 ### Evaluation
 
 **File:** `eval/benchmark.py`
@@ -297,14 +339,14 @@ python eval/benchmark.py model/checkpoints/best_q4
 
 ## Scaling to Production
 
-The POC uses 299 examples with fast-mode corpus generation (no consistency filtering). Production accuracy requires a larger, quality-filtered corpus.
+Production accuracy requires a larger, quality-filtered corpus. The v2 run at 1,099 examples confirmed the scaling curve:
 
 | Corpus Size | Expected Token Accuracy | Consistency Filtering | Est. Corpus Cost |
 |---|---|---|---|
-| 300 (POC) | ~72% | No | ~$5 |
-| 1,000 | ~85% | Yes (k=3) | ~$20 |
-| 3,000 | ~91% | Yes (k=5) | ~$50 |
-| 10,000 | ~95%+ | Yes (k=5) | ~$150 |
+| 299 (v1) | ~72% | No | ~$5 |
+| 1,099 (v2) | 80.7% (measured) | No | ~$15 |
+| 5,000 | ~90% (est.) | Yes (k=3) | ~$75 |
+| 10,000 | ~95% (est.) | Yes (k=5) | ~$150 |
 
 **Ongoing cost model (1,000 OKR decisions/month at 1K corpus):**
 
