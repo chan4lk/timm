@@ -31,13 +31,18 @@ from keyflow_bridge import KeyflowBridge
 ENGINE: OKRInference | None = None
 BRIDGE: KeyflowBridge | None = None
 MODEL_NAME = "okr-micro-asms"
+CHECKPOINT_DIR: Path | None = None
+CURRENT_CHECKPOINT: str = ""
+UI_PATH = Path(__file__).parent / "ui.html"
 
 
 class OpenAIHandler(BaseHTTPRequestHandler):
     """Handles OpenAI-compatible chat/completions requests."""
 
     def do_GET(self):
-        if self.path == "/v1/models":
+        if self.path == "/" or self.path == "/ui":
+            self._serve_ui()
+        elif self.path == "/v1/models":
             self._send_json(200, {
                 "object": "list",
                 "data": [{
@@ -52,6 +57,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     },
                 }],
             })
+        elif self.path == "/v1/asms/checkpoints":
+            self._list_checkpoints()
         elif self.path == "/health":
             self._send_json(200, {"status": "ok", "model": MODEL_NAME})
         else:
@@ -62,6 +69,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_chat_completions()
         elif self.path == "/v1/completions":
             self._handle_completions()
+        elif self.path == "/v1/asms/switch":
+            self._switch_checkpoint()
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -238,6 +247,59 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
+    def _serve_ui(self):
+        """Serve the chat UI."""
+        if UI_PATH.exists():
+            html = UI_PATH.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+        else:
+            self._send_json(404, {"error": "ui.html not found"})
+
+    def _list_checkpoints(self):
+        """List available model checkpoints."""
+        checkpoints = []
+        if CHECKPOINT_DIR and CHECKPOINT_DIR.exists():
+            for cp in sorted(CHECKPOINT_DIR.iterdir()):
+                config_file = cp / "config.json"
+                if config_file.exists():
+                    with open(config_file) as f:
+                        cfg = json.load(f)
+                    checkpoints.append({
+                        "name": cp.name,
+                        "path": str(cp),
+                        "params": cfg.get("hidden_dim", 0),
+                        "quantized": "quantization" in cfg,
+                        "active": str(cp) == CURRENT_CHECKPOINT,
+                    })
+        self._send_json(200, {"checkpoints": checkpoints})
+
+    def _switch_checkpoint(self):
+        """Hot-swap the model to a different checkpoint."""
+        global ENGINE, CURRENT_CHECKPOINT
+        body = self._read_body()
+        if body is None:
+            return
+        checkpoint = body.get("checkpoint", "")
+        cp_path = Path(checkpoint)
+        if not (cp_path / "config.json").exists():
+            self._send_json(400, {"error": f"Invalid checkpoint: {checkpoint}"})
+            return
+        try:
+            ENGINE = OKRInference(str(cp_path))
+            CURRENT_CHECKPOINT = str(cp_path)
+            self._send_json(200, {
+                "status": "ok",
+                "model": cp_path.name,
+                "params": ENGINE.model.num_params,
+                "checkpoint": str(cp_path),
+            })
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+
     def _read_body(self) -> dict | None:
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
@@ -274,7 +336,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ENGINE, BRIDGE
+    global ENGINE, BRIDGE, CHECKPOINT_DIR, CURRENT_CHECKPOINT
 
     parser = argparse.ArgumentParser(description="ASMS OpenAI-compatible API server")
     parser.add_argument("checkpoint", help="Path to model checkpoint")
@@ -288,6 +350,8 @@ def main():
     print("=" * 50)
 
     ENGINE = OKRInference(args.checkpoint, args.tokenizer)
+    CURRENT_CHECKPOINT = str(Path(args.checkpoint).resolve())
+    CHECKPOINT_DIR = Path(args.checkpoint).resolve().parent
 
     try:
         BRIDGE = KeyflowBridge()
@@ -298,14 +362,14 @@ def main():
 
     server = HTTPServer((args.host, args.port), OpenAIHandler)
     print(f"\nServer running at http://localhost:{args.port}")
+    print(f"  Chat UI:     http://localhost:{args.port}/")
+    print(f"  API:         http://localhost:{args.port}/v1/chat/completions")
     print(f"  Models:      http://localhost:{args.port}/v1/models")
-    print(f"  Chat:        http://localhost:{args.port}/v1/chat/completions")
-    print(f"  Completions: http://localhost:{args.port}/v1/completions")
+    print(f"  Checkpoints: http://localhost:{args.port}/v1/asms/checkpoints")
     print(f"  Health:      http://localhost:{args.port}/health")
-    print(f"\nConnect from LM Studio / Open WebUI:")
+    print(f"\nOpenAI-compatible endpoint:")
     print(f"  Base URL: http://localhost:{args.port}/v1")
     print(f"  Model:    {MODEL_NAME}")
-    print(f"  API Key:  any (not checked)")
     print()
 
     try:
