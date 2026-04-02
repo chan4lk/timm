@@ -23,10 +23,10 @@ class OKRModelConfig:
 
     vocab_size: int = 8000
     max_seq_len: int = 512
-    num_layers: int = 4
-    hidden_dim: int = 256
-    num_heads: int = 4
-    ffn_dim: int = 512  # 2x hidden
+    num_layers: int = 6
+    hidden_dim: int = 384
+    num_heads: int = 6
+    ffn_dim: int = 768  # 2x hidden
     dropout: float = 0.1
     rope_theta: float = 10000.0
 
