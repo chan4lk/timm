@@ -135,6 +135,34 @@ class OKRInference:
             except json.JSONDecodeError:
                 pass
 
+        # Infer workflow from tool calls or methodology if not explicitly tagged
+        if not result["workflow"]:
+            notes = result.get("methodology_notes", {})
+            tc = result.get("tool_calls", [])
+            tools_used = {t.get("tool") for t in tc if isinstance(t, dict) and not t.get("parse_error")}
+            report_type = notes.get("report_type")
+
+            if report_type in ("progress", "health_check", "summary", "health"):
+                result["workflow"] = "reports"
+            elif notes.get("committed_ratio") is not None or notes.get("ramp_appropriate") is not None:
+                result["workflow"] = "onboard"
+            elif notes.get("alignment_direction"):
+                result["workflow"] = "align"
+            elif notes.get("score_zone") or notes.get("sandbagging_risk") is not None:
+                result["workflow"] = "check_in"
+            elif "report" in tools_used:
+                result["workflow"] = "reports"
+            elif "user" in tools_used:
+                result["workflow"] = "onboard"
+            elif any(t.get("action") == "align" for t in tc if isinstance(t, dict)):
+                result["workflow"] = "align"
+            elif any(t.get("action") == "check_in" for t in tc if isinstance(t, dict)):
+                result["workflow"] = "check_in"
+            elif any(t.get("action") == "list" for t in tc if isinstance(t, dict)):
+                result["workflow"] = "view_okrs"
+            elif any(t.get("action") == "create" for t in tc if isinstance(t, dict)):
+                result["workflow"] = "goal_to_okr"
+
         return result
 
     def confidence_score(self, result: dict) -> float:
